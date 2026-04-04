@@ -319,7 +319,7 @@ TimerState ReadCurrentState()
 	// for client worlds). Fall back to timer-actor-only mode when unavailable.
 	SDK::UCrEnviroWaveSubsystem* waveSub = FindEnviroWaveSubsystem(world);
 	state.diag.hasSubsystem = (waveSub != nullptr);
-	LOG_INFO("ReadCurrentState: waveSub=%s nextTimeRemaining=%.1f waveNumber=%d",
+	LOG_DEBUG("ReadCurrentState: waveSub=%s nextTimeRemaining=%.1f waveNumber=%d",
 		waveSub ? "FOUND" : "absent", nextTimeRemaining, timerActor->NextPhase);
 
 	if (!waveSub)
@@ -353,7 +353,7 @@ TimerState ReadCurrentState()
 			state.diag.rawStage    = static_cast<int>(repStage);
 			state.diag.rawWaveType = static_cast<int>(repWave);
 
-			LOG_INFO("ReadCurrentState: repActor FOUND — repStage=%d repWave=%d",
+			LOG_DEBUG("ReadCurrentState: repActor FOUND — repStage=%d repWave=%d",
 				static_cast<int>(repStage), static_cast<int>(repWave));
 
 			state.waveType = static_cast<uint8_t>(repWave);
@@ -422,7 +422,7 @@ TimerState ReadCurrentState()
 			// NextPhase directly encodes the current interval (0=Stable, 1=Warning,
 			// 2=Burning, 3=post-wave). nextTimeRemaining = time left in that interval.
 			state.diag.codePath = "stateMachine";
-			LOG_INFO("ReadCurrentState: repActor absent — using client-side phase state machine");
+			LOG_DEBUG("ReadCurrentState: repActor absent — using client-side phase state machine");
 
 			UpdateClientPhaseStateMachine(
 				(float)serverTime, nextTimeRemaining,
@@ -449,7 +449,7 @@ TimerState ReadCurrentState()
 	SDK::EEnviroWaveStage stage = waveSub->GetCurrentStage();
 	state.diag.rawStage    = static_cast<int>(stage);
 	state.diag.rawWaveType = static_cast<int>(waveType);
-	LOG_INFO("ReadCurrentState: subsystem stage=%d waveType=%d nextTimeRemaining=%.1f",
+	LOG_DEBUG("ReadCurrentState: subsystem stage=%d waveType=%d nextTimeRemaining=%.1f",
 		static_cast<int>(stage), static_cast<int>(waveType), nextTimeRemaining);
 
 	if (stage == SDK::EEnviroWaveStage::None)
