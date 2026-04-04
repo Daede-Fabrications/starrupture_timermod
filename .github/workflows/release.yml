@@ -16,7 +16,8 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          submodules: true
+          submodules: recursive
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Add MSBuild to PATH
         uses: microsoft/setup-msbuild@v2
