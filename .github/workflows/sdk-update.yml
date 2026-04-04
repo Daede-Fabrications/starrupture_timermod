@@ -1,0 +1,111 @@
+name: Auto-update SDK and release
+
+# Fires in three ways:
+#   1. Daily poll  — checks whether a new SDK release is available
+#   2. Manual run  — workflow_dispatch for on-demand checks
+#   3. External    — repository_dispatch with event_type "sdk-released"
+#                    (the SDK repo can POST to this repo's dispatches endpoint
+#                     from its own release workflow using a PAT/fine-grained
+#                     token that has repo access here)
+on:
+  schedule:
+    - cron: '0 6 * * 1'    # 06:00 UTC every Monday
+  workflow_dispatch:
+  repository_dispatch:
+    types: [sdk-released]
+
+permissions:
+  contents: write
+
+jobs:
+  check-and-update:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check for new SDK release and update submodule
+        id: update
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+
+          # Determine the tag to target:
+          # - repository_dispatch may supply it in client_payload.tag
+          # - otherwise query the latest release from the SDK repo
+          DISPATCH_TAG="${{ github.event.client_payload.tag }}"
+          if [ -n "$DISPATCH_TAG" ]; then
+            LATEST_TAG="$DISPATCH_TAG"
+            echo "Using tag from dispatch payload: $LATEST_TAG"
+          else
+            LATEST_TAG=$(gh api repos/AlienXAXS/StarRupture-Game-SDK/releases/latest \
+              --jq '.tag_name' 2>/dev/null || echo "")
+            if [ -z "$LATEST_TAG" ]; then
+              echo "No releases found in SDK repo — nothing to do."
+              echo "updated=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "Latest SDK release: $LATEST_TAG"
+          fi
+
+          # Resolve the commit SHA the release tag points to
+          RELEASE_SHA=$(gh api "repos/AlienXAXS/StarRupture-Game-SDK/commits/$LATEST_TAG" \
+            --jq '.sha' 2>/dev/null || echo "")
+
+          CURRENT_SHA=$(git -C "StarRupture SDK" rev-parse HEAD)
+          echo "Current submodule SHA : $CURRENT_SHA"
+          echo "Latest release SHA    : ${RELEASE_SHA:-<could not resolve>}"
+
+          if [ -z "$RELEASE_SHA" ]; then
+            echo "Could not resolve commit for tag $LATEST_TAG — skipping."
+            echo "updated=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "$CURRENT_SHA" = "$RELEASE_SHA" ]; then
+            echo "SDK submodule is already at $LATEST_TAG — nothing to do."
+            echo "updated=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Skip if this repo already has a matching release tag
+          if git tag --list "$LATEST_TAG" | grep -qF "$LATEST_TAG"; then
+            echo "Tag $LATEST_TAG already exists in this repo — skipping."
+            echo "updated=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Update the submodule to the new SDK release tag
+          git -C "StarRupture SDK" fetch --tags origin
+          git -C "StarRupture SDK" checkout "$LATEST_TAG"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add "StarRupture SDK"
+          git commit -m "chore: update StarRupture SDK to $LATEST_TAG"
+          git push origin HEAD:main
+
+          # Push a matching version tag — this triggers release.yml which
+          # builds the DLL and creates the GitHub Release automatically.
+          git tag "$LATEST_TAG"
+          git push origin "$LATEST_TAG"
+
+          echo "updated=true" >> "$GITHUB_OUTPUT"
+          echo "sdk_tag=$LATEST_TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Summary
+        if: always()
+        run: |
+          if [ "${{ steps.update.outputs.updated }}" = "true" ]; then
+            echo "### SDK updated to ${{ steps.update.outputs.sdk_tag }}" >> "$GITHUB_STEP_SUMMARY"
+            echo "Release workflow triggered via tag push." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "### No SDK update needed" >> "$GITHUB_STEP_SUMMARY"
+            echo "SDK submodule is already at the latest release." >> "$GITHUB_STEP_SUMMARY"
+          fi
