@@ -1,12 +1,15 @@
-name: Auto-update SDK and release
+name: Check for SDK update
 
 # Fires in three ways:
-#   1. Daily poll  — checks whether a new SDK release is available
+#   1. Weekly poll — checks whether a new SDK release is available
 #   2. Manual run  — workflow_dispatch for on-demand checks
 #   3. External    — repository_dispatch with event_type "sdk-released"
 #                    (the SDK repo can POST to this repo's dispatches endpoint
 #                     from its own release workflow using a PAT/fine-grained
 #                     token that has repo access here)
+#
+# When a new SDK release is found, a PR is opened against main.
+# You decide when to merge — once merged, push a v* tag to trigger a release build.
 on:
   schedule:
     - cron: '0 6 * * 1'    # 06:00 UTC every Monday
@@ -16,6 +19,7 @@ on:
 
 permissions:
   contents: write
+  pull-requests: write
 
 jobs:
   check-and-update:
@@ -23,13 +27,13 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           submodules: recursive
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Check for new SDK release and update submodule
+      - name: Check for new SDK release and open PR
         id: update
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -74,27 +78,34 @@ jobs:
             exit 0
           fi
 
-          # Skip if this repo already has a matching release tag
-          if git tag --list "$LATEST_TAG" | grep -qF "$LATEST_TAG"; then
-            echo "Tag $LATEST_TAG already exists in this repo — skipping."
+          # Skip if a PR already exists for this SDK version
+          PR_BRANCH="sdk-update/$LATEST_TAG"
+          EXISTING_PR=$(gh pr list --head "$PR_BRANCH" --json number --jq '.[0].number' 2>/dev/null || echo "")
+          if [ -n "$EXISTING_PR" ]; then
+            echo "PR #$EXISTING_PR already exists for $LATEST_TAG — skipping."
             echo "updated=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          # Update the submodule to the new SDK release tag
-          git -C "StarRupture SDK" fetch --tags origin
-          git -C "StarRupture SDK" checkout "$LATEST_TAG"
-
+          # Create branch, update submodule, push
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$PR_BRANCH"
+          git -C "StarRupture SDK" fetch --tags origin
+          git -C "StarRupture SDK" checkout "$LATEST_TAG"
           git add "StarRupture SDK"
           git commit -m "chore: update StarRupture SDK to $LATEST_TAG"
-          git push origin HEAD:main
+          git push origin "$PR_BRANCH"
 
-          # Push a matching version tag — this triggers release.yml which
-          # builds the DLL and creates the GitHub Release automatically.
-          git tag "$LATEST_TAG"
-          git push origin "$LATEST_TAG"
+          # Open PR — you merge when ready, then push a tag to release
+          gh pr create \
+            --title "chore: update StarRupture SDK to $LATEST_TAG" \
+            --body "Updates the StarRupture SDK submodule to [$LATEST_TAG](https://github.com/AlienXAXS/StarRupture-Game-SDK/releases/tag/$LATEST_TAG).
+
+          Test with the updated SDK locally using \`build.sh\` before merging.
+          Once merged, push a \`v*\` tag to trigger a release build." \
+            --base main \
+            --head "$PR_BRANCH"
 
           echo "updated=true" >> "$GITHUB_OUTPUT"
           echo "sdk_tag=$LATEST_TAG" >> "$GITHUB_OUTPUT"
@@ -103,8 +114,8 @@ jobs:
         if: always()
         run: |
           if [ "${{ steps.update.outputs.updated }}" = "true" ]; then
-            echo "### SDK updated to ${{ steps.update.outputs.sdk_tag }}" >> "$GITHUB_STEP_SUMMARY"
-            echo "Release workflow triggered via tag push." >> "$GITHUB_STEP_SUMMARY"
+            echo "### PR opened for SDK ${{ steps.update.outputs.sdk_tag }}" >> "$GITHUB_STEP_SUMMARY"
+            echo "Review, test locally, merge when ready — then push a tag to release." >> "$GITHUB_STEP_SUMMARY"
           else
             echo "### No SDK update needed" >> "$GITHUB_STEP_SUMMARY"
             echo "SDK submodule is already at the latest release." >> "$GITHUB_STEP_SUMMARY"
