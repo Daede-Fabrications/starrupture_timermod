@@ -57,17 +57,34 @@ uint32_t GetServerId()
 
 void ApplyNetworkSync(const TimerSyncPacket& pkt)
 {
+	// Discard our own echoed broadcasts (modloader should not route these back, but be safe).
+	if (pkt.serverId == s_serverId)
+		return;
+
 	if (!s_everReceivedServerPacket)
 	{
-		// First packet ever — pair to this server for the session.
-		s_pairedServerId           = pkt.serverId;
-		s_everReceivedServerPacket = true;
-		LOG_INFO("Client paired to server 0x%08X", pkt.serverId);
+		// Election: lower serverId = started earlier = wins the broadcaster role.
+		// If the incoming ID is lower than ours, defer to that instance.
+		// If ours is lower, we are the broadcaster — discard and keep sending.
+		if (pkt.serverId < s_serverId)
+		{
+			s_pairedServerId           = pkt.serverId;
+			s_everReceivedServerPacket = true;
+			LOG_INFO("Broadcaster elected: deferring to 0x%08X (our id 0x%08X is later)",
+				pkt.serverId, s_serverId);
+		}
+		else
+		{
+			// We started earlier — the sender should defer to us, not the other way around.
+			LOG_DEBUG("Received broadcast from later instance 0x%08X — we (0x%08X) remain broadcaster",
+				pkt.serverId, s_serverId);
+			return;
+		}
 	}
 	else if (pkt.serverId != s_pairedServerId)
 	{
-		// Packet from a different (competing) server — discard.
-		LOG_DEBUG("Ignoring packet from server 0x%08X (paired to 0x%08X)",
+		// Already deferred to a specific broadcaster; ignore all others.
+		LOG_DEBUG("Ignoring broadcast from 0x%08X (deferred to 0x%08X)",
 			pkt.serverId, s_pairedServerId);
 		return;
 	}
@@ -78,6 +95,11 @@ void ApplyNetworkSync(const TimerSyncPacket& pkt)
 	LOG_DEBUG("NetSync received: phase=%d rem=%.1f nextRup=%.1f waveType=%d",
 		(int)pkt.phase, pkt.phaseRemainingSeconds,
 		pkt.nextRuptureInSeconds, (int)pkt.waveType);
+}
+
+bool IsDeferredToExternalBroadcaster()
+{
+	return s_everReceivedServerPacket;
 }
 
 // ---------------------------------------------------------------------------
