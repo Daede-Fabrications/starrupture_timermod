@@ -367,20 +367,22 @@ TimerState ReadCurrentState()
 				const TimerSyncPacket& p = s_netSync.pkt;
 				float elapsed = static_cast<float>(ageMs) / 1000.0f;
 
-				state.diag.codePath = "netSync";
+				state.diag.codePath  = "netSync";
+				state.diag.rawStage  = static_cast<int>(p.rawStage);
 				state.phase    = static_cast<RupturePhase>(p.phase);
 				state.waveType = p.waveType;
 				state.paused   = (p.paused != 0);
 				state.waveNumber = p.waveNumber;
 
-				switch (state.phase)
+				// rawPhaseName from the server's authoritative EEnviroWaveStage
+				switch (p.rawStage)
 				{
-					case RupturePhase::Stable:      state.diag.rawPhaseName = "net:Stable";      break;
-					case RupturePhase::Warning:     state.diag.rawPhaseName = "net:PreWave";     break;
-					case RupturePhase::Burning:     state.diag.rawPhaseName = "net:Moving";      break;
-					case RupturePhase::Cooling:     state.diag.rawPhaseName = "net:Fadeout";     break;
-					case RupturePhase::Stabilizing: state.diag.rawPhaseName = "net:Growback";    break;
-					default:                        state.diag.rawPhaseName = "net:Unknown";     break;
+					case 0:  state.diag.rawPhaseName = "None";     break; // EEnviroWaveStage::None
+					case 1:  state.diag.rawPhaseName = "PreWave";  break;
+					case 2:  state.diag.rawPhaseName = "Moving";   break;
+					case 3:  state.diag.rawPhaseName = "Fadeout";  break;
+					case 4:  state.diag.rawPhaseName = "Growback"; break;
+					default: state.diag.rawPhaseName = "Stage?";   break;
 				}
 
 				switch (state.phase)

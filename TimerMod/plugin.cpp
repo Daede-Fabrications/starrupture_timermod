@@ -126,7 +126,11 @@ static void OnEngineTick(float deltaSeconds)
 			pkt.phase                 = static_cast<uint8_t>(s_lastState.phase);
 			pkt.waveType              = s_lastState.waveType;
 			pkt.paused                = s_lastState.paused ? 1 : 0;
-			pkt.pad                   = 0;
+			// rawStage carries the server's EEnviroWaveStage so the client gets the
+			// authoritative stage enum (Fadeout vs Growback) instead of guessing.
+			pkt.rawStage              = (s_lastState.diag.rawStage >= 0)
+			                              ? static_cast<uint8_t>(s_lastState.diag.rawStage)
+			                              : 0;
 
 			Network::SendPacketToAllClients(hooks, g_self, pkt);
 			LOG_DEBUG("NetSync sent: phase=%d rem=%.1f nextRup=%.1f",

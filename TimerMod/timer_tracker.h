@@ -85,7 +85,7 @@ namespace RuptureTimer
 		uint8_t phase;                  // RupturePhase enum value
 		uint8_t waveType;               // 0=None 1=Heat 2=Cold
 		uint8_t paused;                 // 0/1
-		uint8_t pad;                    // keep struct size a multiple of 4
+		uint8_t rawStage;              // EEnviroWaveStage: 0=None 1=PreWave 2=Moving 3=Fadeout 4=Growback
 	};
 
 	// Called from the Network::OnReceive handler in plugin.cpp (client side).
