@@ -4,6 +4,7 @@
 #include "timer_tracker.h"
 #include "data_export.h"
 #include "hud_overlay.h"
+#include "plugin_network_helpers.h"
 
 #include "Engine_classes.hpp"
 
@@ -34,6 +35,13 @@ static PluginInfo s_pluginInfo = {
 // ---------------------------------------------------------------------------
 static bool s_worldReady = false;
 static RuptureTimer::TimerState s_lastState{};
+
+// Server-side: how often to broadcast the timer state to clients.
+// Active phases (Warning/Burning/Cooling/Stabilizing) use the shorter interval
+// because every second matters there; Stable can afford a longer heartbeat.
+static constexpr float NET_SYNC_INTERVAL_STABLE = 10.0f;
+static constexpr float NET_SYNC_INTERVAL_ACTIVE =  2.0f;
+static float s_netSyncAccum = 0.0f;
 
 // ---------------------------------------------------------------------------
 // Callbacks
@@ -93,6 +101,39 @@ static void OnEngineTick(float deltaSeconds)
 	}
 
 	s_lastState = RuptureTimer::ReadCurrentState();
+
+	// Server: broadcast authoritative timer state to all clients.
+	// Clients that lack UCrEnviroWaveSubsystem (dedicated server scenario) use
+	// this packet instead of GetServerWorldTimeSeconds()-based estimation, which
+	// is susceptible to clock-sync corrections causing visible HUD jumps.
+	auto* hooks = g_self ? g_self->hooks : nullptr;
+	if (hooks && hooks->Network && hooks->Network->IsServer() && s_lastState.valid)
+	{
+		bool activePhase = (s_lastState.phase != RuptureTimer::RupturePhase::Stable &&
+		                    s_lastState.phase != RuptureTimer::RupturePhase::Unknown);
+		float interval = activePhase ? NET_SYNC_INTERVAL_ACTIVE : NET_SYNC_INTERVAL_STABLE;
+
+		s_netSyncAccum += deltaSeconds;
+		if (s_netSyncAccum >= interval)
+		{
+			s_netSyncAccum = 0.0f;
+
+			RuptureTimer::TimerSyncPacket pkt{};
+			pkt.phaseRemainingSeconds = s_lastState.phaseRemainingSeconds;
+			pkt.nextRuptureInSeconds  = s_lastState.nextRuptureInSeconds;
+			pkt.stableRemaining       = s_lastState.stableRemaining;
+			pkt.waveNumber            = s_lastState.waveNumber;
+			pkt.phase                 = static_cast<uint8_t>(s_lastState.phase);
+			pkt.waveType              = s_lastState.waveType;
+			pkt.paused                = s_lastState.paused ? 1 : 0;
+			pkt.pad                   = 0;
+
+			Network::SendPacketToAllClients(hooks, g_self, pkt);
+			LOG_DEBUG("NetSync sent: phase=%d rem=%.1f nextRup=%.1f",
+				(int)pkt.phase, pkt.phaseRemainingSeconds, pkt.nextRuptureInSeconds);
+		}
+	}
+
 	DataExport::Update(deltaSeconds, s_lastState);
 	DataExport::UpdateDiagnosticLog(deltaSeconds, s_lastState);
 	HudOverlay::SetState(s_lastState);
@@ -141,6 +182,24 @@ __declspec(dllexport) bool PluginInit(IPluginSelf* self)
 	{
 		hooks->Engine->RegisterOnTick(OnEngineTick);
 		LOG_DEBUG("Registered engine tick callback");
+	}
+
+	// Network sync — client registers a typed receive handler; server side sends
+	// in OnEngineTick.  IsServer() check is deferred to tick time because the
+	// network channel reports the correct side only after world init.
+	if (hooks->Network)
+	{
+		Network::OnReceive<RuptureTimer::TimerSyncPacket>(
+			hooks, self,
+			[](const RuptureTimer::TimerSyncPacket& pkt)
+			{
+				RuptureTimer::ApplyNetworkSync(pkt);
+			});
+		LOG_DEBUG("Registered TimerSyncPacket receive handler");
+	}
+	else
+	{
+		LOG_DEBUG("hooks->Network not available — network sync disabled");
 	}
 
 	// HUD overlay — only register if the overlay is enabled in config.

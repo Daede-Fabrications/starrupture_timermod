@@ -26,6 +26,34 @@ namespace HudOverlay
 static RuptureTimer::TimerState s_state = {};
 
 // ---------------------------------------------------------------------------
+// Smooth display values — interpolated at wall-clock rate in OnPostRender.
+//
+// Problem: GetServerWorldTimeSeconds() is periodically corrected by the server.
+// Each correction causes nextRuptureInSeconds (= NextTime - serverTime) to
+// jump by the correction delta, which looks like a visible snap on the HUD.
+//
+// Fix: maintain locally-interpolated display values that count down at real
+// wall-clock rate between server updates.  Only snap to the server value when
+// the discrepancy is larger than SNAP_THRESHOLD (catches genuine phase
+// transitions like Stable→Warning which change remaining by hundreds of
+// seconds) or when the phase itself changes.
+//
+// SNAP_THRESHOLD: server-clock corrections are typically < 2 s in UE5 net
+// play.  3 s absorbs those while still catching legitimate phase-change jumps.
+// ---------------------------------------------------------------------------
+static constexpr float SNAP_THRESHOLD = 3.0f;
+
+static float s_dispNextRup   = -1.0f;
+static float s_dispPhaseRem  = -1.0f;
+static float s_dispStableRem = -1.0f;
+
+static RuptureTimer::RupturePhase s_prevPhase = RuptureTimer::RupturePhase::Unknown;
+
+static LARGE_INTEGER s_qpcFreq      = {};
+static LARGE_INTEGER s_lastQpcTime  = {};
+static bool          s_qpcReady     = false;
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -150,6 +178,63 @@ static void OnPostRender(void* hudPtr)
 	if (!s_state.valid)
 		return;
 
+	// -----------------------------------------------------------------------
+	// Step 1 — compute wall-clock frame delta via QPC.
+	// -----------------------------------------------------------------------
+	LARGE_INTEGER qpcNow;
+	QueryPerformanceCounter(&qpcNow);
+
+	float dt = 0.0f;
+	if (!s_qpcReady)
+	{
+		QueryPerformanceFrequency(&s_qpcFreq);
+		s_qpcReady    = true;
+		s_lastQpcTime = qpcNow;
+	}
+	else if (s_qpcFreq.QuadPart > 0)
+	{
+		dt = static_cast<float>(qpcNow.QuadPart - s_lastQpcTime.QuadPart)
+		     / static_cast<float>(s_qpcFreq.QuadPart);
+		// Guard against stalls / debugger pauses warping the display.
+		if (dt > 2.0f) dt = 0.0f;
+	}
+	s_lastQpcTime = qpcNow;
+
+	// -----------------------------------------------------------------------
+	// Step 2 — tick display values down at wall-clock rate.
+	// -----------------------------------------------------------------------
+	if (s_dispNextRup   >= 0.0f) s_dispNextRup   -= dt;
+	if (s_dispPhaseRem  >= 0.0f) s_dispPhaseRem  -= dt;
+	if (s_dispStableRem >= 0.0f) s_dispStableRem -= dt;
+
+	// -----------------------------------------------------------------------
+	// Step 3 — sync from server when needed.
+	//   • Phase changed            → always snap (new cycle, values are stale).
+	//   • Display uninitialised    → snap.
+	//   • Discrepancy > threshold  → snap (genuine phase-transition jump).
+	//   • Small discrepancy        → ignore; local interpolation is smoother.
+	// -----------------------------------------------------------------------
+	bool phaseChanged = (s_state.phase != s_prevPhase);
+	s_prevPhase = s_state.phase;
+
+	auto Sync = [phaseChanged](float& disp, float srv)
+	{
+		if (srv < 0.0f)          { disp = srv; return; } // unknown → pass through
+		if (disp < 0.0f)         { disp = srv; return; } // uninitialised
+		if (phaseChanged)        { disp = srv; return; } // phase flip
+		if (disp - srv > SNAP_THRESHOLD ||
+		    srv - disp > SNAP_THRESHOLD) { disp = srv; } // large jump
+		// else: keep locally interpolated value
+	};
+
+	Sync(s_dispNextRup,   s_state.nextRuptureInSeconds);
+	Sync(s_dispPhaseRem,  s_state.phaseRemainingSeconds);
+	Sync(s_dispStableRem, s_state.stableRemaining);
+
+	if (s_dispNextRup   < 0.0f) s_dispNextRup   = 0.0f;
+	if (s_dispPhaseRem  < 0.0f) s_dispPhaseRem  = 0.0f;
+	if (s_dispStableRem < 0.0f) s_dispStableRem = 0.0f;
+
 	SDK::UCanvas* canvas = self->Canvas;
 	const float screenW = static_cast<float>(canvas->SizeX);
 	const float screenH = static_cast<float>(canvas->SizeY);
@@ -183,7 +268,7 @@ static void OnPostRender(void* hudPtr)
 
 	// --- Line 1: Next Rupture countdown ---
 	char nextBuf[16];
-	FormatTime(nextBuf, sizeof(nextBuf), s_state.nextRuptureInSeconds, /*nowOnZero=*/true);
+	FormatTime(nextBuf, sizeof(nextBuf), s_state.nextRuptureInSeconds >= 0.0f ? s_dispNextRup : -1.0f, /*nowOnZero=*/true);
 
 	char line1[48];
 	_snprintf_s(line1, sizeof(line1), _TRUNCATE, "Next Rupture: %s", nextBuf);
@@ -202,7 +287,7 @@ static void OnPostRender(void* hudPtr)
 
 	// --- Line 3: Current phase timer ---
 	char phaseBuf[16];
-	FormatTime(phaseBuf, sizeof(phaseBuf), s_state.phaseRemainingSeconds);
+	FormatTime(phaseBuf, sizeof(phaseBuf), s_state.phaseRemainingSeconds >= 0.0f ? s_dispPhaseRem : -1.0f);
 
 	char line3[48];
 	_snprintf_s(line3, sizeof(line3), _TRUNCATE, "Wave Timer: %s", phaseBuf);
@@ -245,7 +330,7 @@ static void OnPostRender(void* hudPtr)
 		}
 		if (s_state.stableRemaining >= 0.0f)
 		{
-			FormatTime(tbuf, sizeof(tbuf), s_state.stableRemaining);
+			FormatTime(tbuf, sizeof(tbuf), s_dispStableRem);
 			_snprintf_s(buf, sizeof(buf), _TRUNCATE, "  Stable:      %s", tbuf);
 			DrawLine(self, x, curY, scale, buf);
 			curY += lineH;

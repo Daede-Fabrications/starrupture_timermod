@@ -4,6 +4,8 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#define WIN32_LEAN_AND_MEAN
+#include <Windows.h>
 #include "Basic.hpp"
 #include "Engine_classes.hpp"
 #include "Chimera_classes.hpp"
@@ -11,6 +13,32 @@
 
 namespace RuptureTimer
 {
+
+// ---------------------------------------------------------------------------
+// Network sync state — written by ApplyNetworkSync() when a TimerSyncPacket
+// arrives from the server plugin, read by ReadCurrentState() on every tick.
+// ---------------------------------------------------------------------------
+struct NetworkSyncState
+{
+	TimerSyncPacket pkt;
+	ULONGLONG       receivedAtMs;  // GetTickCount64() at time of receipt
+	bool            valid;
+};
+static NetworkSyncState s_netSync = {};
+
+// Stale threshold: if no packet has arrived in this many seconds, fall back
+// to the local computation paths (repActor / stateMachine).
+static constexpr float NET_SYNC_STALE_SEC = 30.0f;
+
+void ApplyNetworkSync(const TimerSyncPacket& pkt)
+{
+	s_netSync.pkt          = pkt;
+	s_netSync.receivedAtMs = GetTickCount64();
+	s_netSync.valid        = true;
+	LOG_DEBUG("NetSync received: phase=%d rem=%.1f nextRup=%.1f waveType=%d",
+		(int)pkt.phase, pkt.phaseRemainingSeconds,
+		pkt.nextRuptureInSeconds, (int)pkt.waveType);
+}
 
 // ---------------------------------------------------------------------------
 // Find UCrEnviroWaveSubsystem by iterating GObjects for the given world.
@@ -324,6 +352,56 @@ TimerState ReadCurrentState()
 
 	if (!waveSub)
 	{
+		// ------------------------------------------------------------------
+		// Network sync path — server plugin broadcasts authoritative state.
+		// Preferred over repActor/stateMachine because the server computes
+		// remaining time without GetServerWorldTimeSeconds() drift.
+		// We interpolate locally using wall-clock elapsed time since receipt.
+		// ------------------------------------------------------------------
+		if (s_netSync.valid)
+		{
+			ULONGLONG ageMs = GetTickCount64() - s_netSync.receivedAtMs;
+			if (ageMs < static_cast<ULONGLONG>(NET_SYNC_STALE_SEC * 1000.0f))
+			{
+				const TimerSyncPacket& p = s_netSync.pkt;
+				float elapsed = static_cast<float>(ageMs) / 1000.0f;
+
+				state.diag.codePath = "netSync";
+				state.phase    = static_cast<RupturePhase>(p.phase);
+				state.waveType = p.waveType;
+				state.paused   = (p.paused != 0);
+				state.waveNumber = p.waveNumber;
+
+				switch (state.phase)
+				{
+					case RupturePhase::Stable:      state.phaseName = "Stable";      break;
+					case RupturePhase::Warning:     state.phaseName = "Warning";     break;
+					case RupturePhase::Burning:     state.phaseName = "Burning";     break;
+					case RupturePhase::Cooling:     state.phaseName = "Cooling";     break;
+					case RupturePhase::Stabilizing: state.phaseName = "Stabilizing"; break;
+					default:                        state.phaseName = "Unknown";     break;
+				}
+				switch (state.waveType)
+				{
+					case 1:  state.waveTypeName = "Heat"; break;
+					case 2:  state.waveTypeName = "Cold"; break;
+					default: state.waveTypeName = "None"; break;
+				}
+
+				auto Interp = [elapsed](float base) -> float {
+					return (base >= 0.0f) ? fmaxf(0.0f, base - elapsed) : -1.0f;
+				};
+				state.phaseRemainingSeconds = Interp(p.phaseRemainingSeconds);
+				state.nextRuptureInSeconds  = Interp(p.nextRuptureInSeconds);
+				state.stableRemaining       = Interp(p.stableRemaining);
+
+				return state;
+			}
+			// Packet is stale — fall through to repActor / stateMachine
+			LOG_DEBUG("ReadCurrentState: netSync packet is stale (%.0fs) — falling back",
+				static_cast<float>(ageMs) / 1000.0f);
+		}
+
 		LOG_DEBUG("ReadCurrentState: UCrEnviroWaveSubsystem absent — using replication-actor mode");
 
 		// Try ACrGatherableSpawnersRepActor — a replicated actor present on all clients.

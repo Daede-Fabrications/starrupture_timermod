@@ -63,6 +63,28 @@ namespace RuptureTimer
 		DiagnosticRawData diag;             // raw values for diagnostic logging
 	};
 
+	// ---------------------------------------------------------------------------
+	// Network sync — server plugin broadcasts this packet to clients every few
+	// seconds so they get server-authoritative time without depending on
+	// GetServerWorldTimeSeconds() drift/corrections.
+	// Must be trivially copyable (plain POD, no pointers).
+	// ---------------------------------------------------------------------------
+	struct TimerSyncPacket
+	{
+		float   phaseRemainingSeconds;  // time left in current phase (-1 = unknown)
+		float   nextRuptureInSeconds;   // primary countdown value (-1 = unknown)
+		float   stableRemaining;        // stable-period duration (-1 = unknown)
+		int32_t waveNumber;             // ACrWaveTimerActor::NextPhase
+		uint8_t phase;                  // RupturePhase enum value
+		uint8_t waveType;               // 0=None 1=Heat 2=Cold
+		uint8_t paused;                 // 0/1
+		uint8_t pad;                    // keep struct size a multiple of 4
+	};
+
+	// Called from the Network::OnReceive handler in plugin.cpp (client side).
+	// Stores the packet with a local timestamp for interpolation.
+	void ApplyNetworkSync(const TimerSyncPacket& pkt);
+
 	// Read current rupture timer state from the game. Call only from game thread.
 	TimerState ReadCurrentState();
 }
