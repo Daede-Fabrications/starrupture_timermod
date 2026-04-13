@@ -303,6 +303,7 @@ TimerState ReadCurrentState()
 	state.diag.rawProgress         = -1.0f;
 	memset(state.diag.repActorBytes, 0, sizeof(state.diag.repActorBytes));
 	state.diag.repActorBytesValid  = false;
+	state.diag.rawPhaseName        = "?";
 
 	SDK::UWorld* world = SDK::UWorld::GetWorld();
 	if (!world) { LOG_WARN_ONCE("ReadCurrentState: UWorld is null"); return state; }
@@ -374,6 +375,16 @@ TimerState ReadCurrentState()
 
 				switch (state.phase)
 				{
+					case RupturePhase::Stable:      state.diag.rawPhaseName = "net:Stable";      break;
+					case RupturePhase::Warning:     state.diag.rawPhaseName = "net:PreWave";     break;
+					case RupturePhase::Burning:     state.diag.rawPhaseName = "net:Moving";      break;
+					case RupturePhase::Cooling:     state.diag.rawPhaseName = "net:Fadeout";     break;
+					case RupturePhase::Stabilizing: state.diag.rawPhaseName = "net:Growback";    break;
+					default:                        state.diag.rawPhaseName = "net:Unknown";     break;
+				}
+
+				switch (state.phase)
+				{
 					case RupturePhase::Stable:      state.phaseName = "Stable";      break;
 					case RupturePhase::Warning:     state.phaseName = "Warning";     break;
 					case RupturePhase::Burning:     state.phaseName = "Burning";     break;
@@ -430,6 +441,15 @@ TimerState ReadCurrentState()
 
 			state.diag.rawStage    = static_cast<int>(repStage);
 			state.diag.rawWaveType = static_cast<int>(repWave);
+			switch (repStage)
+			{
+				case SDK::EEnviroWaveStage::None:     state.diag.rawPhaseName = "None";     break;
+				case SDK::EEnviroWaveStage::PreWave:  state.diag.rawPhaseName = "PreWave";  break;
+				case SDK::EEnviroWaveStage::Moving:   state.diag.rawPhaseName = "Moving";   break;
+				case SDK::EEnviroWaveStage::Fadeout:  state.diag.rawPhaseName = "Fadeout";  break;
+				case SDK::EEnviroWaveStage::Growback: state.diag.rawPhaseName = "Growback"; break;
+				default:                              state.diag.rawPhaseName = "Stage?";   break;
+			}
 
 			LOG_DEBUG("ReadCurrentState: repActor FOUND — repStage=%d repWave=%d",
 				static_cast<int>(repStage), static_cast<int>(repWave));
@@ -500,6 +520,14 @@ TimerState ReadCurrentState()
 			// NextPhase directly encodes the current interval (0=Stable, 1=Warning,
 			// 2=Burning, 3=post-wave). nextTimeRemaining = time left in that interval.
 			state.diag.codePath = "stateMachine";
+			switch (timerActor->NextPhase)
+			{
+				case 0:  state.diag.rawPhaseName = "NP0=Stable";   break;
+				case 1:  state.diag.rawPhaseName = "NP1=PreWave";  break;
+				case 2:  state.diag.rawPhaseName = "NP2=Moving";   break;
+				case 3:  state.diag.rawPhaseName = "NP3=PostWave"; break;
+				default: state.diag.rawPhaseName = "NP?=Unknown";  break;
+			}
 			LOG_DEBUG("ReadCurrentState: repActor absent — using client-side phase state machine");
 
 			UpdateClientPhaseStateMachine(
@@ -527,6 +555,15 @@ TimerState ReadCurrentState()
 	SDK::EEnviroWaveStage stage = waveSub->GetCurrentStage();
 	state.diag.rawStage    = static_cast<int>(stage);
 	state.diag.rawWaveType = static_cast<int>(waveType);
+	switch (stage)
+	{
+		case SDK::EEnviroWaveStage::None:     state.diag.rawPhaseName = "None";     break;
+		case SDK::EEnviroWaveStage::PreWave:  state.diag.rawPhaseName = "PreWave";  break;
+		case SDK::EEnviroWaveStage::Moving:   state.diag.rawPhaseName = "Moving";   break;
+		case SDK::EEnviroWaveStage::Fadeout:  state.diag.rawPhaseName = "Fadeout";  break;
+		case SDK::EEnviroWaveStage::Growback: state.diag.rawPhaseName = "Growback"; break;
+		default:                              state.diag.rawPhaseName = "Stage?";   break;
+	}
 	LOG_DEBUG("ReadCurrentState: subsystem stage=%d waveType=%d nextTimeRemaining=%.1f",
 		static_cast<int>(stage), static_cast<int>(waveType), nextTimeRemaining);
 

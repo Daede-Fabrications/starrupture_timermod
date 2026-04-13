@@ -151,6 +151,10 @@ static bool     s_prevRawPaused    = false;
 static float    s_prevRemaining    = -99.0f;
 static const char* s_prevCodePath  = "";
 
+// Separate tracking for immediate phase-change log lines (bypasses the 1s throttle).
+static int32_t s_immediatePrevNextPhase = -99;
+static int     s_immediatePrevRawStage  = -99;
+
 static bool DiagStateChanged(const RuptureTimer::TimerState& state)
 {
 	const auto& d = state.diag;
@@ -196,23 +200,24 @@ static void WriteDiagLine(const char* filePath, const RuptureTimer::TimerState& 
 
 	char line[512];
 	_snprintf_s(line, sizeof(line), _TRUNCATE,
-		"%.1f,%s,%s,%d,%d,%.1f,%.1f,%.4f,%d,%s,%.4f,%s,%s,%.1f,%.1f,%s\n",
-		d.rawServerTime,                         // serverTime
-		reason,                                  // trigger (change/heartbeat)
-		d.codePath,                              // path
-		d.rawStage,                              // rawStage
-		d.rawWaveType,                           // rawWave
-		d.rawNextTime,                           // nextTime (absolute)
-		d.rawNextTimeRemaining,                  // remaining
-		d.rawProgress,                           // progress (subsystem only)
-		d.rawNextPhase,                          // nextPhase
-		d.rawPaused ? "Y" : "N",                // paused
-		state.phaseRemainingSeconds,             // computed phaseRem
-		state.phaseName ? state.phaseName : "?", // computed phase
+		"%.1f,%s,%s,%d,%d,%.1f,%.1f,%.4f,%d,%s,%s,%.4f,%s,%s,%.1f,%.1f,%s\n",
+		d.rawServerTime,                              // serverTime
+		reason,                                       // trigger (change/heartbeat/phaseChange)
+		d.codePath,                                   // path
+		d.rawStage,                                   // rawStage
+		d.rawWaveType,                                // rawWave
+		d.rawNextTime,                                // nextTime (absolute)
+		d.rawNextTimeRemaining,                       // remaining
+		d.rawProgress,                                // progress (subsystem only)
+		d.rawNextPhase,                               // nextPhase (raw int)
+		d.rawPhaseName ? d.rawPhaseName : "?",        // rawPhaseName (game-internal label)
+		d.rawPaused ? "Y" : "N",                     // paused
+		state.phaseRemainingSeconds,                  // computed phaseRem
+		state.phaseName ? state.phaseName : "?",      // computed phase
 		state.waveTypeName ? state.waveTypeName : "?", // computed waveType
-		state.nextRuptureInSeconds,              // computed nextRup
-		state.stableRemaining,                   // computed stableRem
-		hexBuf);                                 // repActor hex dump
+		state.nextRuptureInSeconds,                   // computed nextRup
+		state.stableRemaining,                        // computed stableRem
+		hexBuf);                                      // repActor hex dump
 
 	f << line;
 	f.close();
@@ -255,7 +260,7 @@ void EnsureDiagnosticLogDir()
 			std::ofstream f(path, std::ios::out | std::ios::app);
 			if (f.is_open())
 			{
-				f << "serverTime,trigger,path,rawStage,rawWave,nextTime,remaining,progress,nextPhase,paused,phaseRem,phase,waveType,nextRup,stableRem,repActorHex\n";
+				f << "serverTime,trigger,path,rawStage,rawWave,nextTime,remaining,progress,nextPhase,rawPhaseName,paused,phaseRem,phase,waveType,nextRup,stableRem,repActorHex\n";
 				f.close();
 			}
 		}
@@ -280,7 +285,22 @@ void UpdateDiagnosticLog(float deltaSeconds, const RuptureTimer::TimerState& sta
 	s_diagAccumulator    += deltaSeconds;
 	s_diagHeartbeatAccum += deltaSeconds;
 
-	// Throttle: don't log more than once per second
+	// Immediate phase-change line — bypasses the 1s throttle so that short
+	// phases (e.g. a 13 s Warning) are always captured at the exact tick the
+	// game changes NextPhase or EEnviroWaveStage.
+	const auto& d = state.diag;
+	bool immediatePhaseChange = (d.rawNextPhase != s_immediatePrevNextPhase ||
+	                             d.rawStage     != s_immediatePrevRawStage);
+	if (immediatePhaseChange)
+	{
+		s_immediatePrevNextPhase = d.rawNextPhase;
+		s_immediatePrevRawStage  = d.rawStage;
+		WriteDiagLine(RuptureTimerConfig::Config::GetDiagnosticLogPath(), state, "phaseChange");
+		UpdatePrevDiagState(state);
+		s_diagAccumulator = 0.0f; // reset throttle — next change line in >=1s
+	}
+
+	// Throttle: don't log more than once per second for non-phase-change events
 	if (s_diagAccumulator < DIAG_MIN_INTERVAL)
 		return;
 	s_diagAccumulator = 0.0f;
