@@ -326,101 +326,103 @@ TimerState ReadCurrentState()
 	float rawUnclamped = timerActor->NextTime - (float)serverTime;
 	float nextTimeRemaining = (rawUnclamped < 0.0f) ? 0.0f : rawUnclamped;
 
-	// Populate common diagnostic fields
+	// Populate common diagnostic fields.
+	// Store rawUnclamped so the log shows the true negative value when NextTime
+	// is stale — logging the clamped 0.0 hides the problem.
 	state.diag.rawNextTime          = timerActor->NextTime;
 	state.diag.rawServerTime        = serverTime;
-	state.diag.rawNextTimeRemaining = nextTimeRemaining;
+	state.diag.rawNextTimeRemaining = rawUnclamped;
 	state.diag.rawNextPhase         = timerActor->NextPhase;
 	state.diag.rawPaused            = timerActor->bPause;
 
-	// If NextTime is significantly in the past the WaveTimerActor hasn't
-	// received its replication update yet. Return Unknown until it does.
-	if (rawUnclamped < -60.0f)
-	{
-		LOG_WARN_ONCE("ReadCurrentState: NextTime is %.0fs in the past — rupture cycle not active", rawUnclamped);
-		state.phase     = RupturePhase::Unknown;
-		state.phaseName = "Waiting";
-		return state;
-	}
-
-	// Try to find the wave subsystem. It is server-authoritative and will be absent
-	// on clients connected to a dedicated server (ShouldCreateSubsystem returns false
-	// for client worlds). Fall back to timer-actor-only mode when unavailable.
+	// Discover the wave subsystem early — we need to know whether we're on a
+	// local/listen-server (subsystem present) or dedicated-server client before
+	// deciding which path to take.  Subsystem lookup is O(GObjects) so it runs
+	// once per tick; the early-out paths below avoid redundant work.
 	SDK::UCrEnviroWaveSubsystem* waveSub = FindEnviroWaveSubsystem(world);
 	state.diag.hasSubsystem = (waveSub != nullptr);
 	LOG_DEBUG("ReadCurrentState: waveSub=%s nextTimeRemaining=%.1f waveNumber=%d",
 		waveSub ? "FOUND" : "absent", nextTimeRemaining, timerActor->NextPhase);
 
+	// ------------------------------------------------------------------
+	// Network sync path — must run BEFORE the stale-NextTime guard.
+	// The server broadcasts authoritative state independently of NextTime
+	// replication, so we can recover even when NextTime hasn't arrived yet.
+	// ------------------------------------------------------------------
+	if (!waveSub && s_netSync.valid)
+	{
+		ULONGLONG ageMs = GetTickCount64() - s_netSync.receivedAtMs;
+		if (ageMs < static_cast<ULONGLONG>(NET_SYNC_STALE_SEC * 1000.0f))
+		{
+			const TimerSyncPacket& p = s_netSync.pkt;
+			float elapsed = static_cast<float>(ageMs) / 1000.0f;
+
+			state.diag.codePath  = "netSync";
+			state.diag.rawStage  = static_cast<int>(p.rawStage);
+			state.phase    = static_cast<RupturePhase>(p.phase);
+			state.waveType = p.waveType;
+			state.paused   = (p.paused != 0);
+			state.waveNumber = p.waveNumber;
+
+			// rawPhaseName from the server's authoritative EEnviroWaveStage
+			switch (p.rawStage)
+			{
+				case 0:  state.diag.rawPhaseName = "None";     break; // EEnviroWaveStage::None
+				case 1:  state.diag.rawPhaseName = "PreWave";  break;
+				case 2:  state.diag.rawPhaseName = "Moving";   break;
+				case 3:  state.diag.rawPhaseName = "Fadeout";  break;
+				case 4:  state.diag.rawPhaseName = "Growback"; break;
+				default: state.diag.rawPhaseName = "Stage?";   break;
+			}
+
+			switch (state.phase)
+			{
+				case RupturePhase::Stable:      state.phaseName = "Stable";      break;
+				case RupturePhase::Warning:     state.phaseName = "Warning";     break;
+				case RupturePhase::Burning:     state.phaseName = "Burning";     break;
+				case RupturePhase::Cooling:     state.phaseName = "Cooling";     break;
+				case RupturePhase::Stabilizing: state.phaseName = "Stabilizing"; break;
+				default:                        state.phaseName = "Unknown";     break;
+			}
+			switch (state.waveType)
+			{
+				case 1:  state.waveTypeName = "Heat"; break;
+				case 2:  state.waveTypeName = "Cold"; break;
+				default: state.waveTypeName = "None"; break;
+			}
+
+			auto Interp = [elapsed](float base) -> float {
+				return (base >= 0.0f) ? fmaxf(0.0f, base - elapsed) : -1.0f;
+			};
+			state.phaseRemainingSeconds = Interp(p.phaseRemainingSeconds);
+			state.nextRuptureInSeconds  = Interp(p.nextRuptureInSeconds);
+			state.stableRemaining       = Interp(p.stableRemaining);
+
+			return state;
+		}
+		// Packet is stale — fall through to repActor / stateMachine
+		LOG_DEBUG("ReadCurrentState: netSync packet is stale (%.0fs) — falling back",
+			static_cast<float>(ageMs) / 1000.0f);
+	}
+
+	// ------------------------------------------------------------------
+	// Stale NextTime guard — only blocks paths that derive timing from
+	// NextTime (repActor timing, stateMachine).  netSync already handled.
+	// repActor can still identify the current phase even without timing.
+	// ------------------------------------------------------------------
+	bool nextTimeValid = (rawUnclamped >= -60.0f);
+	if (!nextTimeValid)
+		LOG_WARN_ONCE("ReadCurrentState: NextTime is %.0fs in the past — timing unavailable, phase detection only", rawUnclamped);
+
 	if (!waveSub)
 	{
-		// ------------------------------------------------------------------
-		// Network sync path — server plugin broadcasts authoritative state.
-		// Preferred over repActor/stateMachine because the server computes
-		// remaining time without GetServerWorldTimeSeconds() drift.
-		// We interpolate locally using wall-clock elapsed time since receipt.
-		// ------------------------------------------------------------------
-		if (s_netSync.valid)
-		{
-			ULONGLONG ageMs = GetTickCount64() - s_netSync.receivedAtMs;
-			if (ageMs < static_cast<ULONGLONG>(NET_SYNC_STALE_SEC * 1000.0f))
-			{
-				const TimerSyncPacket& p = s_netSync.pkt;
-				float elapsed = static_cast<float>(ageMs) / 1000.0f;
-
-				state.diag.codePath  = "netSync";
-				state.diag.rawStage  = static_cast<int>(p.rawStage);
-				state.phase    = static_cast<RupturePhase>(p.phase);
-				state.waveType = p.waveType;
-				state.paused   = (p.paused != 0);
-				state.waveNumber = p.waveNumber;
-
-				// rawPhaseName from the server's authoritative EEnviroWaveStage
-				switch (p.rawStage)
-				{
-					case 0:  state.diag.rawPhaseName = "None";     break; // EEnviroWaveStage::None
-					case 1:  state.diag.rawPhaseName = "PreWave";  break;
-					case 2:  state.diag.rawPhaseName = "Moving";   break;
-					case 3:  state.diag.rawPhaseName = "Fadeout";  break;
-					case 4:  state.diag.rawPhaseName = "Growback"; break;
-					default: state.diag.rawPhaseName = "Stage?";   break;
-				}
-
-				switch (state.phase)
-				{
-					case RupturePhase::Stable:      state.phaseName = "Stable";      break;
-					case RupturePhase::Warning:     state.phaseName = "Warning";     break;
-					case RupturePhase::Burning:     state.phaseName = "Burning";     break;
-					case RupturePhase::Cooling:     state.phaseName = "Cooling";     break;
-					case RupturePhase::Stabilizing: state.phaseName = "Stabilizing"; break;
-					default:                        state.phaseName = "Unknown";     break;
-				}
-				switch (state.waveType)
-				{
-					case 1:  state.waveTypeName = "Heat"; break;
-					case 2:  state.waveTypeName = "Cold"; break;
-					default: state.waveTypeName = "None"; break;
-				}
-
-				auto Interp = [elapsed](float base) -> float {
-					return (base >= 0.0f) ? fmaxf(0.0f, base - elapsed) : -1.0f;
-				};
-				state.phaseRemainingSeconds = Interp(p.phaseRemainingSeconds);
-				state.nextRuptureInSeconds  = Interp(p.nextRuptureInSeconds);
-				state.stableRemaining       = Interp(p.stableRemaining);
-
-				return state;
-			}
-			// Packet is stale — fall through to repActor / stateMachine
-			LOG_DEBUG("ReadCurrentState: netSync packet is stale (%.0fs) — falling back",
-				static_cast<float>(ageMs) / 1000.0f);
-		}
-
 		LOG_DEBUG("ReadCurrentState: UCrEnviroWaveSubsystem absent — using replication-actor mode");
 
 		// Try ACrGatherableSpawnersRepActor — a replicated actor present on all clients.
 		// It holds RepEnviroWaveTypeChange and RepEnviroWaveStageChange as persistent
-		// Net/RepNotify fields, giving us accurate phase and wave-type labels.
-		// Per-phase breakdown timers (-1) are not available without the subsystem.
+		// Net/RepNotify fields, giving us accurate phase and wave-type labels even
+		// when NextTime is stale.  Timing fields are left at -1 when nextTimeValid
+		// is false; the netSync path (above) will supply timing once a packet arrives.
 		SDK::ACrGatherableSpawnersRepActor* repActor = FindGatherableSpawnersRepActor(world);
 		if (repActor)
 		{
@@ -453,8 +455,8 @@ TimerState ReadCurrentState()
 				default:                              state.diag.rawPhaseName = "Stage?";   break;
 			}
 
-			LOG_DEBUG("ReadCurrentState: repActor FOUND — repStage=%d repWave=%d",
-				static_cast<int>(repStage), static_cast<int>(repWave));
+			LOG_DEBUG("ReadCurrentState: repActor FOUND — repStage=%d repWave=%d nextTimeValid=%s",
+				static_cast<int>(repStage), static_cast<int>(repWave), nextTimeValid ? "Y" : "N");
 
 			state.waveType = static_cast<uint8_t>(repWave);
 			switch (repWave)
@@ -467,47 +469,50 @@ TimerState ReadCurrentState()
 			switch (repStage)
 			{
 				case SDK::EEnviroWaveStage::None:
-					// Stable — NextTime is the absolute time the next wave fires.
-					state.phase                 = RupturePhase::Stable;
-					state.phaseName             = "Stable";
-					state.phaseRemainingSeconds = nextTimeRemaining;
-					state.nextRuptureInSeconds  = nextTimeRemaining;
-					state.stableRemaining       = nextTimeRemaining;
+					state.phase     = RupturePhase::Stable;
+					state.phaseName = "Stable";
+					if (nextTimeValid)
+					{
+						state.phaseRemainingSeconds = nextTimeRemaining;
+						state.nextRuptureInSeconds  = nextTimeRemaining;
+						state.stableRemaining       = nextTimeRemaining;
+					}
 					break;
 
 				case SDK::EEnviroWaveStage::PreWave:
-					// Warning — NextTime appears to point to when burning starts.
-					state.phase                 = RupturePhase::Warning;
-					state.phaseName             = "Warning";
-					state.phaseRemainingSeconds = nextTimeRemaining;
-					state.nextRuptureInSeconds  = nextTimeRemaining;
+					state.phase     = RupturePhase::Warning;
+					state.phaseName = "Warning";
+					if (nextTimeValid)
+					{
+						state.phaseRemainingSeconds = nextTimeRemaining;
+						state.nextRuptureInSeconds  = nextTimeRemaining;
+					}
 					break;
 
 				case SDK::EEnviroWaveStage::Moving:
-					// Burning — wave is active now.
-					state.phase                 = RupturePhase::Burning;
-					state.phaseName             = "Burning";
-					state.phaseRemainingSeconds = -1.0f; // no progress without subsystem
-					state.nextRuptureInSeconds  = 0.0f;
+					state.phase                = RupturePhase::Burning;
+					state.phaseName            = "Burning";
+					state.nextRuptureInSeconds = 0.0f; // always correct: we're in the rupture
 					break;
 
 				case SDK::EEnviroWaveStage::Fadeout:
-					// Cooling — NextTime is the stable-period countdown (undercount of
-					// total next_rupture since we can't add remaining cooling time).
-					state.phase                 = RupturePhase::Cooling;
-					state.phaseName             = "Cooling";
-					state.phaseRemainingSeconds = -1.0f;
-					state.nextRuptureInSeconds  = nextTimeRemaining;
-					state.stableRemaining       = nextTimeRemaining;
+					state.phase     = RupturePhase::Cooling;
+					state.phaseName = "Cooling";
+					if (nextTimeValid)
+					{
+						state.nextRuptureInSeconds = nextTimeRemaining;
+						state.stableRemaining      = nextTimeRemaining;
+					}
 					break;
 
 				case SDK::EEnviroWaveStage::Growback:
-					// Stabilizing — same situation as Cooling.
-					state.phase                 = RupturePhase::Stabilizing;
-					state.phaseName             = "Stabilizing";
-					state.phaseRemainingSeconds = -1.0f;
-					state.nextRuptureInSeconds  = nextTimeRemaining;
-					state.stableRemaining       = nextTimeRemaining;
+					state.phase     = RupturePhase::Stabilizing;
+					state.phaseName = "Stabilizing";
+					if (nextTimeValid)
+					{
+						state.nextRuptureInSeconds = nextTimeRemaining;
+						state.stableRemaining      = nextTimeRemaining;
+					}
 					break;
 
 				default:
@@ -516,11 +521,11 @@ TimerState ReadCurrentState()
 					break;
 			}
 		}
-		else
+		else if (nextTimeValid)
 		{
-			// Last-resort fallback: no subsystem and no rep actor found.
-			// NextPhase directly encodes the current interval (0=Stable, 1=Warning,
-			// 2=Burning, 3=post-wave). nextTimeRemaining = time left in that interval.
+			// Last-resort fallback: no subsystem, no rep actor, but NextTime is
+			// plausible.  NextPhase directly encodes the current interval (0=Stable,
+			// 1=Warning, 2=Burning, 3=post-wave); nextTimeRemaining = time remaining.
 			state.diag.codePath = "stateMachine";
 			switch (timerActor->NextPhase)
 			{
@@ -537,6 +542,15 @@ TimerState ReadCurrentState()
 				timerActor->NextPhase, world);
 
 			FillStateFromStateMachine(state, nextTimeRemaining);
+		}
+		else
+		{
+			// No subsystem, no repActor, and NextTime is too stale for stateMachine.
+			// The plugin on this client has nothing to work with yet.
+			// The netSync path (above) will recover once the server broadcasts a packet.
+			state.diag.codePath = "none";
+			state.phase     = RupturePhase::Unknown;
+			state.phaseName = "Waiting";
 		}
 		return state;
 	}
