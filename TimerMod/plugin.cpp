@@ -135,9 +135,9 @@ static void OnAnyWorldBeginPlay(SDK::UWorld* world, const char* worldName)
 	DataExport::EnsureDiagnosticLogDir();
 }
 
-static void OnSaveLoaded()
+static void OnExperienceLoadComplete()
 {
-	LOG_INFO("Save loaded — reading initial rupture timer state");
+	LOG_INFO("Experience load complete — reading initial rupture timer state");
 	s_lastState = RuptureTimer::ReadCurrentState();
 	if (s_lastState.valid)
 	{
@@ -150,7 +150,7 @@ static void OnSaveLoaded()
 	}
 	else
 	{
-		LOG_WARN("  Timer state not available yet (game state not fully loaded?)");
+		LOG_WARN("  Timer state not available yet after experience load — will retry on next tick");
 	}
 }
 
@@ -189,7 +189,7 @@ __declspec(dllexport) bool PluginInit(IPluginSelf* self)
 	if (hooks->World)
 	{
 		hooks->World->RegisterOnAnyWorldBeginPlay(OnAnyWorldBeginPlay);
-		hooks->World->RegisterOnSaveLoaded(OnSaveLoaded);
+		hooks->World->RegisterOnExperienceLoadComplete(OnExperienceLoadComplete);
 		LOG_DEBUG("Registered world/save callbacks");
 	}
 
@@ -281,7 +281,7 @@ __declspec(dllexport) void PluginShutdown()
 		if (hooks->World)
 		{
 			hooks->World->UnregisterOnAnyWorldBeginPlay(OnAnyWorldBeginPlay);
-			hooks->World->UnregisterOnSaveLoaded(OnSaveLoaded);
+			hooks->World->UnregisterOnExperienceLoadComplete(OnExperienceLoadComplete);
 		}
 		if (hooks->Engine)
 			hooks->Engine->UnregisterOnTick(OnEngineTick);
