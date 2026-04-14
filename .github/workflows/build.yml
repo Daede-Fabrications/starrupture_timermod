@@ -22,15 +22,19 @@ jobs:
         uses: microsoft/setup-msbuild@v3
 
       - name: Build Client Release
-        run: |
-          msbuild "StarRupture-TimerMod.sln" `
-            /p:Configuration="Client Release" `
-            /p:Platform=x64 `
-            /m `
-            /v:minimal
+        run: msbuild "StarRupture-TimerMod.sln" /p:Configuration="Client Release" /p:Platform=x64 /m /v:minimal
+
+      - name: Build Server Release
+        run: msbuild "StarRupture-TimerMod.sln" /p:Configuration="Server Release" /p:Platform=x64 /m /v:minimal
 
       - name: Upload Client DLL
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v4
         with:
           name: TimerMod-Client
           path: bin/x64/Client Release/plugins/TimerMod.dll
+
+      - name: Upload Server DLL
+        uses: actions/upload-artifact@v4
+        with:
+          name: TimerMod-Server
+          path: bin/x64/Server Release/plugins/TimerMod.dll

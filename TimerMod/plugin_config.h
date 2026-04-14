@@ -19,7 +19,7 @@ namespace RuptureTimerConfig
 			"Export",
 			"WriteJsonFile",
 			ConfigValueType::Boolean,
-			"true",
+			"false", // Dont force un-needed IO on clients that most of the time wont be needing the JSON output
 			"Write rupture timer state to a JSON file for external tools (e.g. StreamDeck)",
 			0.0f, 0.0f
 		},
@@ -68,7 +68,7 @@ namespace RuptureTimerConfig
 			"HUD",
 			"ShowOverlay",
 			ConfigValueType::Boolean,
-			"false",
+			"true", // Most people will want this on.
 			"Show rupture timer as an in-game text overlay",
 			0.0f, 0.0f
 		},

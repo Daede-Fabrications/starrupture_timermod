@@ -16,4 +16,9 @@ namespace HudOverlay
 	// Push a fresh timer state for the overlay to display.
 	// Call from the engine tick callback after ReadCurrentState().
 	void SetState(const RuptureTimer::TimerState& state);
+
+	// Reset all display state on world teardown (BeforeWorldEndPlay).
+	// Clears the last known timer state and all smoothed interpolation values
+	// so stale data never bleeds into the next world load.
+	void Reset();
 }

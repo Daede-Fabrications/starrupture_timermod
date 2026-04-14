@@ -19,11 +19,12 @@ namespace HudOverlay
 {
 
 // ---------------------------------------------------------------------------
-// Shared timer state — written by SetState() on the game tick,
-// read by Hooked_PostRender() on the render tick.
+// Shared timer state — written by SetState() when new data arrives,
+// read by OnPostRender() on the render tick.
 // Both callbacks execute on the same game thread, so no locking is needed.
 // ---------------------------------------------------------------------------
-static RuptureTimer::TimerState s_state = {};
+static RuptureTimer::TimerState s_state    = {};
+static bool s_newState = false; // set true by SetState, cleared after first Sync
 
 // ---------------------------------------------------------------------------
 // Smooth display values — interpolated at wall-clock rate in OnPostRender.
@@ -208,28 +209,32 @@ static void OnPostRender(void* hudPtr)
 	if (s_dispStableRem >= 0.0f) s_dispStableRem -= dt;
 
 	// -----------------------------------------------------------------------
-	// Step 3 — sync from server when needed.
-	//   • Phase changed            → always snap (new cycle, values are stale).
-	//   • Display uninitialised    → snap.
-	//   • Discrepancy > threshold  → snap (genuine phase-transition jump).
-	//   • Small discrepancy        → ignore; local interpolation is smoother.
+	// Step 3 — sync display values from s_state only when new data has arrived.
+	//
+	// SetState() raises s_newState each time a packet or local update arrives.
+	// Between updates the QPC countdown (Step 2) runs freely.
+	// On a new update: always snap to the server value so the display stays
+	// accurate — at 1 s packet rate the drift is never more than 1 second.
+	// Exception: phase change always snaps regardless of s_newState.
 	// -----------------------------------------------------------------------
 	bool phaseChanged = (s_state.phase != s_prevPhase);
-	s_prevPhase = s_state.phase;
 
-	auto Sync = [phaseChanged](float& disp, float srv)
+	if (s_newState || phaseChanged)
 	{
-		if (srv < 0.0f)          { disp = srv; return; } // unknown → pass through
-		if (disp < 0.0f)         { disp = srv; return; } // uninitialised
-		if (phaseChanged)        { disp = srv; return; } // phase flip
-		if (disp - srv > SNAP_THRESHOLD ||
-		    srv - disp > SNAP_THRESHOLD) { disp = srv; } // large jump
-		// else: keep locally interpolated value
-	};
+		s_newState  = false;
+		s_prevPhase = s_state.phase;
 
-	Sync(s_dispNextRup,   s_state.nextRuptureInSeconds);
-	Sync(s_dispPhaseRem,  s_state.phaseRemainingSeconds);
-	Sync(s_dispStableRem, s_state.stableRemaining);
+		// Always accept the incoming value — at 1 s packet rate there is no
+		// meaningful drift to preserve, and fighting the server value causes
+		// the "counts down then resets" behaviour we fixed previously.
+		if (s_state.nextRuptureInSeconds >= 0.0f) s_dispNextRup   = s_state.nextRuptureInSeconds;
+		if (s_state.phaseRemainingSeconds >= 0.0f) s_dispPhaseRem  = s_state.phaseRemainingSeconds;
+		if (s_state.stableRemaining  >= 0.0f) s_dispStableRem = s_state.stableRemaining;
+		// Pass through unknowns (-1) as-is
+		if (s_state.nextRuptureInSeconds  < 0.0f) s_dispNextRup   = s_state.nextRuptureInSeconds;
+		if (s_state.phaseRemainingSeconds < 0.0f) s_dispPhaseRem  = s_state.phaseRemainingSeconds;
+		if (s_state.stableRemaining       < 0.0f) s_dispStableRem = s_state.stableRemaining;
+	}
 
 	if (s_dispNextRup   < 0.0f) s_dispNextRup   = 0.0f;
 	if (s_dispPhaseRem  < 0.0f) s_dispPhaseRem  = 0.0f;
@@ -385,7 +390,23 @@ void Remove(IPluginHooks* hooks)
 
 void SetState(const RuptureTimer::TimerState& state)
 {
-	s_state = state;
+	s_state    = state;
+	s_newState = true;
+}
+
+void Reset()
+{
+	s_state    = {};
+	s_newState = false;
+	s_dispNextRup   = -1.0f;
+	s_dispPhaseRem  = -1.0f;
+	s_dispStableRem = -1.0f;
+	s_prevPhase     = RuptureTimer::RupturePhase::Unknown;
+	// Reset QPC so the first frame after world reload gets a clean dt=0
+	// rather than a multi-second delta from the previous world's last frame.
+	s_qpcReady      = false;
+	s_lastQpcTime   = {};
+	LOG_DEBUG("[HudOverlay] Reset — display state cleared for next world load");
 }
 
 } // namespace HudOverlay

@@ -4,7 +4,6 @@
 #include "timer_tracker.h"
 #include "data_export.h"
 #include "hud_overlay.h"
-#include "plugin_network_helpers.h"
 
 #include "Engine_classes.hpp"
 
@@ -36,95 +35,73 @@ static PluginInfo s_pluginInfo = {
 static bool s_worldReady = false;
 static RuptureTimer::TimerState s_lastState{};
 
-// How often to broadcast.  Active phases use the short interval because every
-// second matters; Stable can afford a longer heartbeat.
-static constexpr float NET_SYNC_INTERVAL_STABLE = 10.0f;
-static constexpr float NET_SYNC_INTERVAL_ACTIVE  =  2.0f;
+// Server broadcasts state to all clients once per second.
+// The client's HUD interpolates smoothly between packets using its own
+// QPC-based countdown — no sub-interval throttling needed server-side.
+static constexpr float NET_SYNC_INTERVAL = 1.0f;
 static float s_netSyncAccum = 0.0f;
 
 // ---------------------------------------------------------------------------
-// Engine tick
-//
-// Every TimerMod instance starts as a potential broadcaster.  The instance
-// whose serverId is numerically lowest (i.e. was initialised earliest, since
-// the ID is seeded from GetTickCount64) wins the election and keeps sending.
-// All other instances defer once they receive a broadcast from the winner.
-//
-// Broadcasting is suppressed as soon as IsDeferredToExternalBroadcaster()
-// returns true, so the elected winner is the only one sending packets.
+// Server engine tick
 // ---------------------------------------------------------------------------
-static void OnEngineTick(float deltaSeconds)
+static void OnEngineTickServer(float deltaSeconds)
 {
 	if (!s_worldReady) return;
 
-	// Heartbeat log every 5 s to confirm tick is alive
-	static float s_logAccum = 0.0f;
-	s_logAccum += deltaSeconds;
-	if (s_logAccum >= 5.0f)
-	{
-		s_logAccum = 0.0f;
-		LOG_DEBUG("Tick alive — deltaSeconds=%.4f | broadcaster=%s",
-			deltaSeconds,
-			RuptureTimer::IsDeferredToExternalBroadcaster() ? "DEFERRED" : "SELF");
-	}
+	s_netSyncAccum += deltaSeconds;
+	if (s_netSyncAccum < NET_SYNC_INTERVAL)
+		return;
+	s_netSyncAccum = 0.0f;
 
 	s_lastState = RuptureTimer::ReadCurrentState();
 
-	// ---- Broadcast path ------------------------------------------------
-	// Only the elected broadcaster (lowest serverId, not yet deferred) sends.
 	auto* hooks = g_self ? g_self->hooks : nullptr;
-	if (hooks && hooks->Network && s_lastState.valid
-	    && !RuptureTimer::IsDeferredToExternalBroadcaster())
-	{
-		bool activePhase = (s_lastState.phase != RuptureTimer::RupturePhase::Stable &&
-		                    s_lastState.phase != RuptureTimer::RupturePhase::Unknown);
-		float interval = activePhase ? NET_SYNC_INTERVAL_ACTIVE : NET_SYNC_INTERVAL_STABLE;
+	RuptureTimer::BroadcastState(s_lastState, hooks, g_self);
 
-		s_netSyncAccum += deltaSeconds;
-		if (s_netSyncAccum >= interval)
-		{
-			s_netSyncAccum = 0.0f;
-
-			RuptureTimer::TimerSyncPacket pkt{};
-			pkt.phaseRemainingSeconds = s_lastState.phaseRemainingSeconds;
-			pkt.nextRuptureInSeconds  = s_lastState.nextRuptureInSeconds;
-			pkt.stableRemaining       = s_lastState.stableRemaining;
-			pkt.waveNumber            = s_lastState.waveNumber;
-			pkt.serverId              = RuptureTimer::GetServerId();
-			pkt.phase                 = static_cast<uint8_t>(s_lastState.phase);
-			pkt.waveType              = s_lastState.waveType;
-			pkt.paused                = s_lastState.paused ? 1 : 0;
-			pkt.rawStage              = (s_lastState.diag.rawStage >= 0)
-			                              ? static_cast<uint8_t>(s_lastState.diag.rawStage)
-			                              : 0;
-
-			Network::SendPacketToAllClients(hooks, g_self, pkt);
-			LOG_DEBUG("NetSync broadcast: phase=%d rem=%.1f nextRup=%.1f id=0x%08X",
-				(int)pkt.phase, pkt.phaseRemainingSeconds,
-				pkt.nextRuptureInSeconds, pkt.serverId);
-		}
-	}
-
-	DataExport::Update(deltaSeconds, s_lastState);
-	DataExport::UpdateDiagnosticLog(deltaSeconds, s_lastState);
-	HudOverlay::SetState(s_lastState);
+	DataExport::Update(NET_SYNC_INTERVAL, s_lastState);
+	DataExport::UpdateDiagnosticLog(NET_SYNC_INTERVAL, s_lastState);
 }
 
 // ---------------------------------------------------------------------------
-// Callbacks
+// Client engine tick
+//
+// Before the first server packet: runs local ReadCurrentState() and updates
+// the HUD so the display isn't blank while waiting.
+// After the first server packet: local lookups are permanently disabled.
+// The OnReceive handler is the sole updater of s_lastState and the HUD.
+// DataExport still runs every tick for the JSON output.
+// ---------------------------------------------------------------------------
+static void OnEngineTickClient(float deltaSeconds)
+{
+	if (!s_worldReady) return;
+
+	if (!RuptureTimer::HasReceivedServerPacket())
+	{
+		// No server packet yet — use local data and push it to the HUD.
+		s_lastState = RuptureTimer::ReadCurrentState();
+		HudOverlay::SetState(s_lastState);
+	}
+	// else: OnReceive handles s_lastState and HudOverlay::SetState — nothing to do here.
+
+	DataExport::Update(deltaSeconds, s_lastState);
+	DataExport::UpdateDiagnosticLog(deltaSeconds, s_lastState);
+}
+
+// ---------------------------------------------------------------------------
+// Shared world/experience callbacks
 // ---------------------------------------------------------------------------
 
 static void OnAnyWorldBeginPlay(SDK::UWorld* world, const char* worldName)
 {
 	if (!world || !worldName) return;
 
-	// Only track the main gameplay world
 	if (std::string_view(worldName).find("ChimeraMain") == std::string_view::npos)
 	{
 		if (s_worldReady)
 		{
 			LOG_INFO("World changed to non-gameplay world (%s) — pausing rupture timer tracking", worldName);
-			s_worldReady = false;
+		 s_worldReady = false;
+		 RuptureTimer::OnWorldTeardown();
 		}
 		return;
 	}
@@ -133,11 +110,32 @@ static void OnAnyWorldBeginPlay(SDK::UWorld* world, const char* worldName)
 	s_worldReady = true;
 	DataExport::EnsureOutputDir();
 	DataExport::EnsureDiagnosticLogDir();
+
+	// Cache world objects immediately so ReadCurrentState() has valid pointers
+	// from the very first tick.  OnExperienceLoadComplete may fire before or
+	// after this callback depending on the connection type; calling OnWorldReady()
+	// here ensures the cache is always populated regardless of ordering.
+	// OnExperienceLoadComplete will call it again (idempotent — just overwrites
+	// the pointers with the same values once actors are fully replicated).
+	RuptureTimer::OnWorldReady();
 }
 
-static void OnExperienceLoadComplete()
+// Server only: reads an initial state snapshot so the first broadcast is
+// populated before the first full tick interval elapses.
+static void OnExperienceLoadCompleteServer()
 {
-	LOG_INFO("Experience load complete — reading initial rupture timer state");
+	// ExperienceLoadComplete fires for every world the server loads, including
+	// the pre-game config map.  Only proceed if OnAnyWorldBeginPlay has already
+	// confirmed this is a ChimeraMain world.
+	if (!s_worldReady)
+	{
+		LOG_DEBUG("Experience load complete — world not ChimeraMain, skipping tracker init");
+		return;
+	}
+
+	LOG_INFO("Experience load complete — reading initial rupture timer state (server)");
+	RuptureTimer::OnWorldReady();
+
 	s_lastState = RuptureTimer::ReadCurrentState();
 	if (s_lastState.valid)
 	{
@@ -146,12 +144,157 @@ static void OnExperienceLoadComplete()
 			s_lastState.phaseRemainingSeconds,
 			s_lastState.waveNumber,
 			s_lastState.waveTypeName);
-		HudOverlay::SetState(s_lastState);
 	}
 	else
 	{
-		LOG_WARN("  Timer state not available yet after experience load — will retry on next tick");
+		LOG_WARN("  Timer state not available yet after experience load — will retry on first tick");
 	}
+}
+
+// Client only: the state arrives via network packets; this callback is used
+// only to push any already-received state to the HUD immediately on load.
+static void OnExperienceLoadCompleteClient()
+{
+	// Guard the same as the server path — don't scan a non-gameplay world.
+	if (!s_worldReady)
+	{
+		LOG_DEBUG("Experience load complete — world not ChimeraMain, skipping tracker init");
+		return;
+	}
+
+	LOG_INFO("Experience load complete (client) — scanning for local objects, HUD will update on next packet");
+	RuptureTimer::OnWorldReady();
+
+	if (s_lastState.valid)
+		HudOverlay::SetState(s_lastState);
+}
+
+// Client only: fired before the gameplay world tears down.
+// Clears HUD display state and marks the world as not ready so the tick
+// callbacks don't try to render stale data during level unload.
+static void OnBeforeWorldEndPlayClient(SDK::UWorld* /*world*/, const char* worldName)
+{
+	LOG_INFO("World ending (%s) — resetting client HUD and timer state", worldName ? worldName : "?");
+	s_worldReady = false;
+	s_lastState  = {};
+	RuptureTimer::OnWorldTeardown();
+	HudOverlay::Reset();
+}
+
+// ---------------------------------------------------------------------------
+// PluginInitServer
+//
+// Registers everything the server side needs:
+//   - World / experience callbacks
+//   - Engine tick for state reading + broadcasting
+//   - Data export (so server-side JSON / diagnostic log works)
+// ---------------------------------------------------------------------------
+static bool PluginInitServer(IPluginSelf* self, IPluginHooks* hooks)
+{
+	LOG_INFO("RuptureTimer: initializing as SERVER");
+
+	if (hooks->World)
+	{
+		hooks->World->RegisterOnAnyWorldBeginPlay(OnAnyWorldBeginPlay);
+		hooks->World->RegisterOnExperienceLoadComplete(OnExperienceLoadCompleteServer);
+		LOG_DEBUG("Server: registered world/experience callbacks");
+	}
+
+	if (hooks->Engine)
+	{
+		hooks->Engine->RegisterOnTick(OnEngineTickServer);
+		LOG_DEBUG("Server: registered OnEngineTickServer");
+	}
+
+	if (hooks->Network)
+		LOG_INFO("Server: network ready — will broadcast TimerSyncPacket to clients");
+	else
+		LOG_WARN("Server: hooks->Network is null — clients will not receive timer sync");
+
+	// Detect an already-active world (hot reload via mod loader UI).
+	// Only treat the world as ready if it's actually ChimeraMain — the server
+	// may be sitting on its config/lobby map when the plugin is first loaded.
+	if (SDK::UWorld* world = SDK::UWorld::GetWorld())
+	{
+		std::string worldName = world->GetName();
+		if (worldName.find("ChimeraMain") != std::string::npos)
+		{
+			LOG_INFO("Server: active ChimeraMain world detected on init — starting tracking immediately");
+			s_worldReady = true;
+			RuptureTimer::OnWorldReady();
+			s_lastState = RuptureTimer::ReadCurrentState();
+			DataExport::EnsureOutputDir();
+			DataExport::EnsureDiagnosticLogDir();
+		}
+		else
+		{
+			LOG_DEBUG("Server: active world '%s' is not ChimeraMain — deferring tracker init", worldName.c_str());
+		}
+	}
+
+	LOG_INFO("Server: initialized — JSON output: %s", RuptureTimerConfig::Config::GetJsonFilePath());
+	return true;
+}
+
+// ---------------------------------------------------------------------------
+// PluginInitClient
+//
+// Registers everything the client side needs:
+//   - Network receive handler (feeds s_lastState via ApplyNetworkSync)
+//   - World / experience callbacks
+//   - Engine tick for HUD + data export
+//   - HUD overlay (if enabled in config)
+// ---------------------------------------------------------------------------
+static bool PluginInitClient(IPluginSelf* self, IPluginHooks* hooks)
+{
+	LOG_INFO("RuptureTimer: initializing as CLIENT");
+
+	if (hooks->Network)
+	{
+		RuptureTimer::RegisterClientReceive(hooks, self,
+			[](const RuptureTimer::TimerState& state)
+			{
+				s_lastState = state;
+				HudOverlay::SetState(s_lastState);
+			});
+		LOG_INFO("Client: network ready — listening for TimerSyncPacket broadcasts");
+	}
+	else
+	{
+		LOG_WARN("Client: hooks->Network is null — timer sync from server unavailable");
+	}
+
+	if (hooks->World)
+	{
+		hooks->World->RegisterOnAnyWorldBeginPlay(OnAnyWorldBeginPlay);
+		hooks->World->RegisterOnExperienceLoadComplete(OnExperienceLoadCompleteClient);
+		hooks->World->RegisterOnBeforeWorldEndPlay(OnBeforeWorldEndPlayClient);
+		LOG_DEBUG("Client: registered world/experience callbacks");
+	}
+
+	if (hooks->Engine)
+	{
+		hooks->Engine->RegisterOnTick(OnEngineTickClient);
+		LOG_DEBUG("Client: registered OnEngineTickClient");
+	}
+
+	// HUD overlay — client only; hooks->HUD is null on server builds.
+	if (RuptureTimerConfig::Config::ShouldShowOverlay())
+	{
+		if (!HudOverlay::Install(hooks))
+			LOG_WARN("Client: HUD overlay could not be installed — in-game display unavailable");
+	}
+	else
+	{
+		LOG_DEBUG("Client: HUD overlay disabled in config (HUD.ShowOverlay=false)");
+	}
+
+	// No active-world hot-reload read here: the client has no authoritative
+	// subsystem to read from.  The next server broadcast will populate state.
+
+	LOG_INFO("Client: initialized — HUD overlay: %s",
+		RuptureTimerConfig::Config::ShouldShowOverlay() ? "enabled" : "disabled");
+	return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -186,84 +329,18 @@ __declspec(dllexport) bool PluginInit(IPluginSelf* self)
 
 	auto* hooks = self->hooks;
 
-	if (hooks->World)
+	if (!hooks->Network)
 	{
-		hooks->World->RegisterOnAnyWorldBeginPlay(OnAnyWorldBeginPlay);
-		hooks->World->RegisterOnExperienceLoadComplete(OnExperienceLoadComplete);
-		LOG_DEBUG("Registered world/save callbacks");
+		// Generic / offline build — no network channel available.
+		// Run server-style init so local state reading and data export still work.
+		LOG_INFO("hooks->Network is null — running in offline/local mode");
+		return PluginInitServer(self, hooks);
 	}
 
-	// ---------------------------------------------------------------------------
-	// Network — broadcaster election
-	//
-	// Every TimerMod instance generates its own serverId and starts as a candidate
-	// broadcaster.  When two instances are present, the one with the lower serverId
-	// (earlier start time) wins: the other instance defers once it receives the
-	// winner's first broadcast packet.
-	//
-	// No configuration required — the same DLL handles both roles.
-	// ---------------------------------------------------------------------------
-	RuptureTimer::InitServerMode();  // generates serverId for this instance
+	if (hooks->Network->IsServer())
+		return PluginInitServer(self, hooks);
 
-	if (hooks->Network)
-	{
-		// Register receive handler on every instance.
-		// ApplyNetworkSync() runs the election: lower serverId wins, this instance
-		// defers and stops broadcasting; higher serverId is discarded.
-		Network::OnReceive<RuptureTimer::TimerSyncPacket>(
-			hooks, self,
-			[](const RuptureTimer::TimerSyncPacket& pkt)
-			{
-				RuptureTimer::ApplyNetworkSync(pkt);
-			});
-		LOG_INFO("Network ready — serverId=0x%08X | broadcasting until a lower-ID instance is seen",
-			RuptureTimer::GetServerId());
-	}
-	else
-	{
-		LOG_INFO("Network: hooks->Network not available — local-only mode, serverId=0x%08X",
-			RuptureTimer::GetServerId());
-	}
-
-	if (hooks->Engine)
-	{
-		hooks->Engine->RegisterOnTick(OnEngineTick);
-		LOG_DEBUG("Registered OnEngineTick");
-	}
-
-	// HUD overlay — only register if the overlay is enabled in config.
-	// hooks->HUD is null on server builds; Install() handles that gracefully.
-	if (RuptureTimerConfig::Config::ShouldShowOverlay())
-	{
-		if (!HudOverlay::Install(hooks))
-			LOG_WARN("HUD overlay could not be installed — in-game display will be unavailable");
-	}
-	else
-	{
-		LOG_DEBUG("HUD overlay disabled in config (HUD.ShowOverlay=false)");
-	}
-
-	// If we are being loaded/reloaded while a game world is already active
-	// (e.g. via the mod loader UI), OnAnyWorldBeginPlay will not fire again —
-	// it only fires on world transitions.  Detect this by attempting a direct
-	// state read.
-	{
-		s_lastState = RuptureTimer::ReadCurrentState();
-		if (s_lastState.valid)
-		{
-			LOG_INFO("Active game world detected on init — starting tracking immediately");
-			s_worldReady = true;
-			DataExport::EnsureOutputDir();
-			DataExport::EnsureDiagnosticLogDir();
-			HudOverlay::SetState(s_lastState);
-		}
-	}
-
-	LOG_INFO("RuptureTimer initialized — JSON output: %s | HUD overlay: %s",
-		RuptureTimerConfig::Config::GetJsonFilePath(),
-		RuptureTimerConfig::Config::ShouldShowOverlay() ? "enabled" : "disabled");
-
-	return true;
+	return PluginInitClient(self, hooks);
 }
 
 __declspec(dllexport) void PluginShutdown()
@@ -276,15 +353,31 @@ __declspec(dllexport) void PluginShutdown()
 	{
 		auto* hooks = g_self->hooks;
 
-		HudOverlay::Remove(hooks);
-
-		if (hooks->World)
+		if (hooks->Network && !hooks->Network->IsServer())
 		{
-			hooks->World->UnregisterOnAnyWorldBeginPlay(OnAnyWorldBeginPlay);
-			hooks->World->UnregisterOnExperienceLoadComplete(OnExperienceLoadComplete);
+			// Client teardown
+			HudOverlay::Remove(hooks);
+
+			if (hooks->World)
+			{
+				hooks->World->UnregisterOnAnyWorldBeginPlay(OnAnyWorldBeginPlay);
+				hooks->World->UnregisterOnExperienceLoadComplete(OnExperienceLoadCompleteClient);
+				hooks->World->UnregisterOnBeforeWorldEndPlay(OnBeforeWorldEndPlayClient);
+			}
+			if (hooks->Engine)
+				hooks->Engine->UnregisterOnTick(OnEngineTickClient);
 		}
-		if (hooks->Engine)
-			hooks->Engine->UnregisterOnTick(OnEngineTick);
+		else
+		{
+			// Server / offline teardown
+			if (hooks->World)
+			{
+				hooks->World->UnregisterOnAnyWorldBeginPlay(OnAnyWorldBeginPlay);
+				hooks->World->UnregisterOnExperienceLoadComplete(OnExperienceLoadCompleteServer);
+			}
+			if (hooks->Engine)
+				hooks->Engine->UnregisterOnTick(OnEngineTickServer);
+		}
 	}
 
 	g_self = nullptr;

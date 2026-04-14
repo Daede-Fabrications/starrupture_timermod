@@ -30,19 +30,17 @@ jobs:
           echo "BUILD_TAG=$tag" >> $env:GITHUB_OUTPUT
 
       - name: Build Client Release
-        run: |
-          msbuild "StarRupture-TimerMod.sln" `
-            /p:Configuration="Client Release" `
-            /p:Platform=x64 `
-            /p:ModLoaderBuildTag="${{ steps.tag.outputs.BUILD_TAG }}" `
-            /m `
-            /v:minimal
+        run: msbuild "StarRupture-TimerMod.sln" /p:Configuration="Client Release" /p:Platform=x64 /p:ModLoaderBuildTag="${{ steps.tag.outputs.BUILD_TAG }}" /m /v:minimal
+
+      - name: Build Server Release
+        run: msbuild "StarRupture-TimerMod.sln" /p:Configuration="Server Release" /p:Platform=x64 /p:ModLoaderBuildTag="${{ steps.tag.outputs.BUILD_TAG }}" /m /v:minimal
 
       - name: Stage release artifacts
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path release
-          Copy-Item "bin\x64\Client Release\plugins\TimerMod.dll" -Destination "release\TimerMod.dll"
+          Compress-Archive -Path "bin\x64\Client Release\plugins\TimerMod.dll" -DestinationPath "release\TimerMod-Client.zip"
+          Compress-Archive -Path "bin\x64\Server Release\plugins\TimerMod.dll" -DestinationPath "release\TimerMod-Server.zip"
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -50,4 +48,5 @@ jobs:
           name: "RuptureTimer ${{ github.ref_name }}"
           generate_release_notes: true
           files: |
-            release/TimerMod.dll
+            release/TimerMod-Client.zip
+            release/TimerMod-Server.zip
