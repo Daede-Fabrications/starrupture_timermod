@@ -100,8 +100,8 @@ static void OnAnyWorldBeginPlay(SDK::UWorld* world, const char* worldName)
 		if (s_worldReady)
 		{
 			LOG_INFO("World changed to non-gameplay world (%s) — pausing rupture timer tracking", worldName);
-		 s_worldReady = false;
-		 RuptureTimer::OnWorldTeardown();
+			s_worldReady = false;
+			RuptureTimer::OnWorldTeardown();
 		}
 		return;
 	}
@@ -176,7 +176,7 @@ static void OnBeforeWorldEndPlayClient(SDK::UWorld* /*world*/, const char* world
 {
 	LOG_INFO("World ending (%s) — resetting client HUD and timer state", worldName ? worldName : "?");
 	s_worldReady = false;
-	s_lastState  = {};
+	s_lastState = {};
 	RuptureTimer::OnWorldTeardown();
 	HudOverlay::Reset();
 }
@@ -302,85 +302,85 @@ static bool PluginInitClient(IPluginSelf* self, IPluginHooks* hooks)
 // ---------------------------------------------------------------------------
 extern "C" {
 
-__declspec(dllexport) PluginInfo* GetPluginInfo()
-{
-	return &s_pluginInfo;
-}
-
-__declspec(dllexport) bool PluginInit(IPluginSelf* self)
-{
-	g_self = self;
-
-	LOG_INFO("RuptureTimer initializing...");
-
-	RuptureTimerConfig::Config::Initialize(self);
-
-	if (!RuptureTimerConfig::Config::IsEnabled())
+	__declspec(dllexport) PluginInfo* GetPluginInfo()
 	{
-		LOG_WARN("RuptureTimer is disabled in config");
-		return true;
+		return &s_pluginInfo;
 	}
 
-	if (!self || !self->hooks)
+	__declspec(dllexport) bool PluginInit(IPluginSelf* self)
 	{
-		LOG_ERROR("hooks interface is null — cannot register callbacks");
-		return false;
-	}
+		g_self = self;
 
-	auto* hooks = self->hooks;
+		LOG_INFO("RuptureTimer initializing...");
 
-	if (!hooks->Network)
-	{
-		// Generic / offline build — no network channel available.
-		// Run server-style init so local state reading and data export still work.
-		LOG_INFO("hooks->Network is null — running in offline/local mode");
-		return PluginInitServer(self, hooks);
-	}
+		RuptureTimerConfig::Config::Initialize(self);
 
-	if (hooks->Network->IsServer())
-		return PluginInitServer(self, hooks);
-
-	return PluginInitClient(self, hooks);
-}
-
-__declspec(dllexport) void PluginShutdown()
-{
-	LOG_INFO("RuptureTimer shutting down...");
-
-	s_worldReady = false;
-
-	if (g_self && g_self->hooks)
-	{
-		auto* hooks = g_self->hooks;
-
-		if (hooks->Network && !hooks->Network->IsServer())
+		if (!RuptureTimerConfig::Config::IsEnabled())
 		{
-			// Client teardown
-			HudOverlay::Remove(hooks);
+			LOG_WARN("RuptureTimer is disabled in config");
+			return true;
+		}
 
-			if (hooks->World)
-			{
-				hooks->World->UnregisterOnAnyWorldBeginPlay(OnAnyWorldBeginPlay);
-				hooks->World->UnregisterOnExperienceLoadComplete(OnExperienceLoadCompleteClient);
-				hooks->World->UnregisterOnBeforeWorldEndPlay(OnBeforeWorldEndPlayClient);
-			}
-			if (hooks->Engine)
-				hooks->Engine->UnregisterOnTick(OnEngineTickClient);
-		}
-		else
+		if (!self || !self->hooks)
 		{
-			// Server / offline teardown
-			if (hooks->World)
-			{
-				hooks->World->UnregisterOnAnyWorldBeginPlay(OnAnyWorldBeginPlay);
-				hooks->World->UnregisterOnExperienceLoadComplete(OnExperienceLoadCompleteServer);
-			}
-			if (hooks->Engine)
-				hooks->Engine->UnregisterOnTick(OnEngineTickServer);
+			LOG_ERROR("hooks interface is null — cannot register callbacks");
+			return false;
 		}
+
+		auto* hooks = self->hooks;
+
+		if (!hooks->Network)
+		{
+			// Generic / offline build — no network channel available.
+			// Run server-style init so local state reading and data export still work.
+			LOG_INFO("hooks->Network is null — running in offline/local mode");
+			return PluginInitServer(self, hooks);
+		}
+
+		if (hooks->Network->IsServer())
+			return PluginInitServer(self, hooks);
+
+		return PluginInitClient(self, hooks);
 	}
 
-	g_self = nullptr;
-}
+	__declspec(dllexport) void PluginShutdown()
+	{
+		LOG_INFO("RuptureTimer shutting down...");
+
+		s_worldReady = false;
+
+		if (g_self && g_self->hooks)
+		{
+			auto* hooks = g_self->hooks;
+
+			if (hooks->Network && !hooks->Network->IsServer())
+			{
+				// Client teardown
+				HudOverlay::Remove(hooks);
+
+				if (hooks->World)
+				{
+					hooks->World->UnregisterOnAnyWorldBeginPlay(OnAnyWorldBeginPlay);
+					hooks->World->UnregisterOnExperienceLoadComplete(OnExperienceLoadCompleteClient);
+					hooks->World->UnregisterOnBeforeWorldEndPlay(OnBeforeWorldEndPlayClient);
+				}
+				if (hooks->Engine)
+					hooks->Engine->UnregisterOnTick(OnEngineTickClient);
+			}
+			else
+			{
+				// Server / offline teardown
+				if (hooks->World)
+				{
+					hooks->World->UnregisterOnAnyWorldBeginPlay(OnAnyWorldBeginPlay);
+					hooks->World->UnregisterOnExperienceLoadComplete(OnExperienceLoadCompleteServer);
+				}
+				if (hooks->Engine)
+					hooks->Engine->UnregisterOnTick(OnEngineTickServer);
+			}
+		}
+
+		g_self = nullptr;
+	}
 
 } // extern "C"
